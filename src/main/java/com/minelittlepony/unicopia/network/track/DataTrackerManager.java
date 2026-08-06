@@ -2,8 +2,11 @@ package com.minelittlepony.unicopia.network.track;
 
 import java.util.List;
 import java.util.Optional;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
+import java.lang.reflect.Method;
 
 import com.minelittlepony.unicopia.network.Channel;
 
@@ -14,10 +17,12 @@ import net.minecraft.network.packet.Packet;
 import net.minecraft.registry.DynamicRegistryManager;
 import net.minecraft.server.network.ServerPlayerEntity;
 
+
+
 public class DataTrackerManager {
     private final Entity entity;
-    private final DynamicRegistryManager lookup;
-    final boolean isClient;
+    private DynamicRegistryManager lookup;
+    private Boolean isClient;
     private final List<DataTracker> trackers = new ObjectArrayList<>();
     private final List<ObjectTracker<?>> objectTrackers = new ObjectArrayList<>();
     private final List<PacketEmitter> packetEmitters = new ObjectArrayList<>();
@@ -26,9 +31,27 @@ public class DataTrackerManager {
 
     public DataTrackerManager(Entity entity) {
         this.entity = entity;
-        this.lookup = entity.getWorld().getRegistryManager();
-        this.isClient = entity.getWorld().isClient;
+        // entity.getWorld() can be null at construction time; resolve lazily instead.
         this.primaryTracker = checkoutTracker();
+    }
+
+    // Lazily resolves the registry lookup once the entity has a world.
+    public DynamicRegistryManager getLookup() {
+        if (lookup == null && entity.getWorld() != null) {
+            lookup = entity.getWorld().getRegistryManager();
+        }
+        return lookup;
+    }
+
+    // Lazily resolves whether we're on the client once the entity has a world.
+    public boolean isClient() {
+        if (isClient == null) {
+            if (entity.getWorld() == null) {
+                return false;
+            }
+            isClient = entity.getWorld().isClient;
+        }
+        return isClient;
     }
 
     public synchronized void addPacketEmitter(PacketEmitter packetEmitter) {
@@ -43,13 +66,14 @@ public class DataTrackerManager {
         DataTracker tracker = new DataTracker(trackers.size());
         trackers.add(tracker);
         packetEmitters.add((sender, initial) -> {
-            var update = initial ? tracker.getInitialPairs(lookup) : tracker.getDirtyPairs(lookup);
+            var update = initial ? tracker.getInitialPairs(getLookup()) : tracker.getDirtyPairs(getLookup());
             if (update.isPresent()) {
-                sender.accept(Channel.SERVER_TRACKED_ENTITY_DATA.toPacket(new MsgTrackedValues(
+                Packet<?> packet = Channel.SERVER_TRACKED_ENTITY_DATA.toPacket(new MsgTrackedValues(
                         entity.getId(),
                         Optional.empty(),
                         update
-                )));
+                ));
+                sendPacketSafely(sender, packet);
             }
         });
         return tracker;
@@ -59,13 +83,14 @@ public class DataTrackerManager {
         ObjectTracker<T> tracker = new ObjectTracker<>(objectTrackers.size(), objFunction);
         objectTrackers.add(tracker);
         packetEmitters.add((sender, initial) -> {
-            var update = initial ? tracker.getInitialPairs(lookup) : tracker.getDirtyPairs(lookup);
+            var update = initial ? tracker.getInitialPairs(getLookup()) : tracker.getDirtyPairs(getLookup());
             if (update.isPresent()) {
-                sender.accept(Channel.SERVER_TRACKED_ENTITY_DATA.toPacket(new MsgTrackedValues(
+                Packet<?> packet = Channel.SERVER_TRACKED_ENTITY_DATA.toPacket(new MsgTrackedValues(
                         entity.getId(),
                         update,
                         Optional.empty()
-                )));
+                ));
+                sendPacketSafely(sender, packet);
             }
         });
         return tracker;
@@ -102,18 +127,56 @@ public class DataTrackerManager {
         packet.updatedTrackers().ifPresent(update -> {
             DataTracker tracker = trackers.get(update.id());
             if (tracker != null) {
-                tracker.load(update, lookup);
+                tracker.load(update, getLookup());
             }
         });
         packet.updatedObjects().ifPresent(update -> {
             ObjectTracker<?> tracker = objectTrackers.get(update.id());
             if (tracker != null) {
-                tracker.load(update, lookup);
+                tracker.load(update, getLookup());
             }
         });
     }
 
     public interface PacketEmitter {
         void sendPackets(Consumer<Packet<?>> consumer, boolean initial);
+    }
+
+    // Some NeoForge/Connector packet acceptors (e.g. PacketAndPayloadAcceptor) implement
+    // Consumer<T> for a narrowed T without a generated accept(Object) bridge method.
+    // `instanceof Consumer` still succeeds since the class implements the interface,
+    // but dispatching accept() on the erased signature throws AbstractMethodError.
+    // Falling back to whichever compatible send method the instance actually exposes
+    // avoids the crash without a compile-time dependency on Connector/NeoForge internals.
+    private static final Map<Class<?>, Method> FALLBACK_METHODS = new ConcurrentHashMap<>();
+
+    @SuppressWarnings({ "unchecked", "rawtypes" })
+    private static void sendPacketSafely(Consumer sender, Packet<?> packet) {
+        if (sender == null) {
+            return;
+        }
+        try {
+            sender.accept(packet);
+        } catch (AbstractMethodError e) {
+            Method fallback = FALLBACK_METHODS.computeIfAbsent(sender.getClass(), DataTrackerManager::findFallbackMethod);
+            if (fallback == null) {
+                throw new RuntimeException("No accept/sendPacket method found on " + sender.getClass(), e);
+            }
+            try {
+                fallback.invoke(sender, packet);
+            } catch (ReflectiveOperationException ex) {
+                throw new RuntimeException("Failed to send packet via fallback method on " + sender.getClass(), ex);
+            }
+        }
+    }
+
+    private static Method findFallbackMethod(Class<?> clazz) {
+        for (Method m : clazz.getMethods()) {
+            if ((m.getName().equals("accept") || m.getName().equals("sendPacket")) && m.getParameterCount() == 1) {
+                m.setAccessible(true);
+                return m;
+            }
+        }
+        return null;
     }
 }
