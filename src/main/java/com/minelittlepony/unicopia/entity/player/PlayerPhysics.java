@@ -57,6 +57,13 @@ import net.minecraft.world.WorldEvents;
 import net.minecraft.world.dimension.DimensionType;
 import net.minecraft.world.event.GameEvent;
 
+import net.minecraft.entity.attribute.EntityAttribute;
+import net.minecraft.entity.attribute.EntityAttributeInstance;
+import net.minecraft.entity.attribute.EntityAttributeModifier;
+import net.minecraft.registry.Registries;
+import net.minecraft.registry.entry.RegistryEntry;
+import net.minecraft.util.Identifier;
+
 public class PlayerPhysics extends EntityPhysics<PlayerEntity> implements Tickable, Motion, NbtSerialisable {
     private static final int MAX_WALL_HIT_CALLDOWN = 30;
     private static final int MAX_TICKS_TO_GLIDE = 20;
@@ -204,6 +211,49 @@ public class PlayerPhysics extends EntityPhysics<PlayerEntity> implements Tickab
         return lastFlightType;
     }
 
+    // The thing I was torturing AI models for 3 straight days. Well, it worked, and flights work like expected, I regret NOTHING!
+    private static final Identifier FLIGHT_GRANT_MODIFIER_ID = Identifier.of("unicopia", "connector_flight_grant");
+    private static final Identifier NEOFORGE_CREATIVE_FLIGHT = Identifier.of("neoforge", "creative_flight");
+
+    private static RegistryEntry<EntityAttribute> neoforgeCreativeFlightAttribute;
+    private static boolean neoforgeCreativeFlightAttributeResolved = false;
+
+    private static RegistryEntry<EntityAttribute> getNeoForgeCreativeFlightAttribute() {
+        if (!neoforgeCreativeFlightAttributeResolved) {
+            neoforgeCreativeFlightAttributeResolved = true; // only try once, ever
+            try {
+                EntityAttribute attribute = Registries.ATTRIBUTE.get(Identifier.of("neoforge", "creative_flight"));
+                if (attribute != null) {
+                    neoforgeCreativeFlightAttribute = Registries.ATTRIBUTE.getEntry(attribute);
+                }
+            } catch (Throwable t) {
+                // Belt-and-braces: if the lookup API differs from what we expect,
+                // don't let a NeoForge-specific quirk break flight on Fabric.
+                Unicopia.LOGGER.warn("Failed to resolve NeoForge creative_flight attribute", t);
+                neoforgeCreativeFlightAttribute = null;
+            }
+        }
+        return neoforgeCreativeFlightAttribute;
+    }
+
+    private void syncNeoForgeFlightPermission(boolean shouldFly) {
+        RegistryEntry<EntityAttribute> attr = getNeoForgeCreativeFlightAttribute();
+        if (attr == null) {
+            return; // not on NeoForge, or lookup failed — no-op, exactly like vanilla Fabric
+        }
+        EntityAttributeInstance instance = entity.getAttributeInstance(attr);
+        if (instance == null) {
+            return;
+        }
+        boolean has = instance.getModifier(FLIGHT_GRANT_MODIFIER_ID) != null;
+        if (shouldFly && !has) {
+            instance.addTemporaryModifier(new EntityAttributeModifier(
+                FLIGHT_GRANT_MODIFIER_ID, 1.0, EntityAttributeModifier.Operation.ADD_VALUE));
+        } else if (!shouldFly && has) {
+            instance.removeModifier(FLIGHT_GRANT_MODIFIER_ID);
+        }
+    }
+
     private FlightType recalculateFlightType() {
         DimensionType dimension = entity.getWorld().getDimension();
 
@@ -294,6 +344,9 @@ public class PlayerPhysics extends EntityPhysics<PlayerEntity> implements Tickab
 
         boolean creative = FlightType.canFlyCreative(entity);
         boolean startedFlyingCreative = !creative && isFlyingEither != entity.getAbilities().flying;
+
+        // I regret nothing!
+        syncNeoForgeFlightPermission(isFlying());
 
         if (!creative) {
             if (entity.isOnGround() || isCancelled) {
